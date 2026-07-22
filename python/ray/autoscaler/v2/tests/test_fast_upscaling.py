@@ -1,9 +1,13 @@
 """Unit tests for V2-fast upscaling (fast path in reconciler)."""
 
 import math
+import os
+import sys
 import time
 from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from ray.autoscaler.v2.instance_manager.config import NodeTypeConfig
 from ray.autoscaler.v2.instance_manager.reconciler import (
@@ -555,3 +559,10 @@ class TestScaleClusterFastPath:
             updates = list(request.updates)
             fast_path_updates = [u for u in updates if "fast-path" in (u.details or "")]
             assert len(fast_path_updates) == 0
+
+
+if __name__ == "__main__":
+    if os.environ.get("PARALLEL_CI"):
+        sys.exit(pytest.main(["-n", "auto", "--boxed", "-vs", __file__]))
+    else:
+        sys.exit(pytest.main(["-sv", __file__]))
