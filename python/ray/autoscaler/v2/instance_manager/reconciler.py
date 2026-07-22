@@ -2,10 +2,16 @@ import logging
 import math
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 from ray._common.utils import binary_to_hex
+from ray.autoscaler._private.constants import (
+    AUTOSCALER_FAST_UPSCALING_DEGRADATION_RATE,
+    AUTOSCALER_FAST_UPSCALING_DOMINANCE_RATIO,
+    AUTOSCALER_FAST_UPSCALING_ENABLED,
+    AUTOSCALER_FAST_UPSCALING_THRESHOLD,
+)
 from ray.autoscaler.v2.instance_manager.cloud_providers.kuberay.cloud_provider import (
     KubeRayProvider,
 )
@@ -54,6 +60,127 @@ from ray.core.generated.instance_manager_pb2 import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def is_homogeneous_demand(ray_state) -> bool:
+    """Check if pending demands are large-batch homogeneous (suitable for fast path).
+
+    Returns True when all of the following hold:
+    1. No gang resource requests (Placement Group needs bin-packing).
+    2. Total pending demand count exceeds threshold.
+    3. Dominant resource shape accounts for >= dominance_ratio of all demands.
+    """
+    if ray_state.pending_gang_resource_requests:
+        return False
+
+    total_count = 0
+    shape_counter: Counter = Counter()
+    for req in ray_state.pending_resource_requests:
+        count = req.count
+        total_count += count
+        shape = frozenset(req.request.resources_bundle.items())
+        shape_counter[shape] += count
+
+    if total_count == 0 or total_count < AUTOSCALER_FAST_UPSCALING_THRESHOLD:
+        return False
+
+    dominant_count = shape_counter.most_common(1)[0][1]
+    dominance_ratio = dominant_count / total_count
+    return dominance_ratio >= AUTOSCALER_FAST_UPSCALING_DOMINANCE_RATIO
+
+
+def compute_fast_target(
+    ray_state: ClusterResourceState,
+    autoscaling_config: "AutoscalingConfig",
+    existing_instances: List["AutoscalerInstance"],
+) -> Tuple[Optional[str], int]:
+    """Compute (node_type, count) for homogeneous fast upscaling.
+
+    Uses multi-dimension ceiling division: for each resource dimension, compute
+    ceil(total_demand / per_node_capacity), take the max across dimensions.
+    Subtracts all in-flight instances to prevent duplicate launches.
+    Respects max_workers constraint.
+
+    Args:
+        ray_state: The ray cluster's resource state.
+        autoscaling_config: The autoscaling config.
+        existing_instances: Current autoscaler instances.
+
+    Returns:
+        (node_type, count_to_launch). count is 0 if no scaling needed.
+    """
+    total_demand: Dict[str, float] = defaultdict(float)
+    for req in ray_state.pending_resource_requests:
+        for k, v in req.request.resources_bundle.items():
+            total_demand[k] += v * req.count
+
+    node_type_configs = autoscaling_config.get_node_type_configs()
+    head_type = autoscaling_config.get_head_node_type()
+
+    # Pick the worker node type (exclude head). In homogeneous scenario there
+    # should be exactly one worker type.
+    worker_types = [nt for nt in node_type_configs if nt != head_type]
+    if not worker_types:
+        return None, 0
+    node_type = worker_types[0]
+    node_resources = node_type_configs[node_type].resources
+
+    if not node_resources:
+        return node_type, 0
+
+    needed = 0
+    for resource, demand in total_demand.items():
+        capacity = node_resources.get(resource, 0)
+        if capacity > 0:
+            needed = max(needed, math.ceil(demand / capacity))
+
+    # Count existing non-terminal instances of this type (in-flight capacity).
+    terminal_statuses = {
+        IMInstance.TERMINATED,
+        IMInstance.ALLOCATION_FAILED,
+        IMInstance.RAY_STOP_REQUESTED,
+    }
+    existing_count = sum(
+        1
+        for inst in existing_instances
+        if inst.im_instance is not None
+        and inst.im_instance.instance_type == node_type
+        and inst.im_instance.status not in terminal_statuses
+    )
+
+    max_workers = autoscaling_config.get_max_num_worker_nodes()
+    if max_workers is not None:
+        to_launch = min(needed - existing_count, max_workers - existing_count)
+    else:
+        to_launch = needed - existing_count
+
+    return node_type, max(0, to_launch)
+
+
+def _check_fast_path_degradation(
+    existing_instances: List["AutoscalerInstance"],
+) -> bool:
+    """Check if fast path should degrade due to high failure rate.
+
+    Returns True if the failure rate exceeds the degradation threshold,
+    meaning we should fall back to the normal scheduler path.
+    """
+    requested_count = 0
+    failed_count = 0
+    for inst in existing_instances:
+        if inst.im_instance is None:
+            continue
+        if inst.im_instance.status == IMInstance.REQUESTED:
+            requested_count += 1
+        elif inst.im_instance.status == IMInstance.ALLOCATION_FAILED:
+            failed_count += 1
+
+    total = requested_count + failed_count
+    if total == 0:
+        return False
+
+    failure_rate = failed_count / total
+    return failure_rate > AUTOSCALER_FAST_UPSCALING_DEGRADATION_RATE
 
 
 class Reconciler:
@@ -1240,89 +1367,165 @@ class Reconciler:
             sched_request.ippr_specs = cloud_provider.get_ippr_specs()
             sched_request.ippr_statuses = cloud_provider.get_ippr_statuses()
 
-        # Ask scheduler for updates to the cluster shape.
-        reply = scheduler.schedule(sched_request)
-
-        # Populate the autoscaling state.
-        autoscaling_state.infeasible_resource_requests.extend(
-            reply.infeasible_resource_requests
-        )
-        autoscaling_state.infeasible_gang_resource_requests.extend(
-            reply.infeasible_gang_resource_requests
-        )
-        autoscaling_state.infeasible_cluster_resource_constraints.extend(
-            reply.infeasible_cluster_resource_constraints
+        # V2-fast: skip expensive bin-packing for homogeneous large-batch demands.
+        use_fast_path = (
+            AUTOSCALER_FAST_UPSCALING_ENABLED
+            and is_homogeneous_demand(ray_state)
+            and not _check_fast_path_degradation(autoscaler_instances)
         )
 
-        if not Reconciler._is_head_node_running(instance_manager):
-            # We shouldn't be scaling the cluster until the head node is ready.
-            # This could happen when the head node (i.e. the raylet) is still
-            # pending registration even though GCS is up.
-            # We will wait until the head node is running and ready to avoid
-            # scaling the cluster from min worker nodes constraint.
-            return
+        if use_fast_path:
+            logger.info("fast-path: homogeneous demand detected, skipping bin-packing.")
+            # Run the scheduler with empty resource requests so it only
+            # performs termination decisions (idle, outdated, min/max)
+            # without the expensive O(tasks*nodes) bin-packing.
+            sched_request_for_terminate = SchedulingRequest(
+                node_type_configs=sched_request.node_type_configs,
+                max_num_nodes=sched_request.max_num_nodes,
+                resource_requests=[],
+                gang_resource_requests=[],
+                cluster_resource_constraints=(
+                    sched_request.cluster_resource_constraints
+                ),
+                current_instances=sched_request.current_instances,
+                idle_timeout_s=sched_request.idle_timeout_s,
+                disable_launch_config_check=(sched_request.disable_launch_config_check),
+            )
+            reply = scheduler.schedule(sched_request_for_terminate)
 
-        if autoscaling_config.provider == Provider.READ_ONLY:
-            # We shouldn't be scaling the cluster if the provider is read-only.
-            return
+            autoscaling_state.infeasible_resource_requests.extend(
+                reply.infeasible_resource_requests
+            )
+            autoscaling_state.infeasible_gang_resource_requests.extend(
+                reply.infeasible_gang_resource_requests
+            )
+            autoscaling_state.infeasible_cluster_resource_constraints.extend(
+                reply.infeasible_cluster_resource_constraints
+            )
 
-        # Scale the clusters if needed.
-        to_launch = reply.to_launch
-        to_terminate = reply.to_terminate
-        updates = {}
-        # Add terminating instances.
-        for terminate_request in to_terminate:
-            instance_id = terminate_request.instance_id
-            if terminate_request.instance_status == IMInstance.QUEUED:
-                # QUEUED instances have no cloud resources allocated yet.
-                # Cancel the allocation request by transitioning directly to TERMINATED.
-                updates[terminate_request.instance_id] = IMInstanceUpdateEvent(
-                    instance_id=instance_id,
-                    new_instance_status=IMInstance.TERMINATED,
-                    termination_request=terminate_request,
-                    details=f"allocation canceled: {terminate_request.details}",
-                )
-            elif terminate_request.instance_status in (
-                IMInstance.ALLOCATED,
-                IMInstance.RAY_INSTALLING,
-            ):
-                # The instance is not yet running, so we can't request to stop/drain Ray.
-                # Therefore, we can skip the RAY_STOP_REQUESTED state and directly terminate the node.
-                im_instance_to_terminate = im_instances_by_instance_id[instance_id]
-                updates[terminate_request.instance_id] = IMInstanceUpdateEvent(
-                    instance_id=instance_id,
-                    new_instance_status=IMInstance.TERMINATING,
-                    cloud_instance_id=im_instance_to_terminate.cloud_instance_id,
-                    termination_request=terminate_request,
-                    details=f"terminating ray: {terminate_request.details}",
-                )
-            else:
-                updates[terminate_request.instance_id] = IMInstanceUpdateEvent(
-                    instance_id=instance_id,
-                    new_instance_status=IMInstance.RAY_STOP_REQUESTED,
-                    termination_request=terminate_request,
-                    details=f"draining ray: {terminate_request.details}",
-                )
+            if not Reconciler._is_head_node_running(instance_manager):
+                return
+            if autoscaling_config.provider == Provider.READ_ONLY:
+                return
 
-        # Add new instances.
-        for launch_request in to_launch:
-            for _ in range(launch_request.count):
+            updates = {}
+            # Honour termination decisions from the scheduler (idle, outdated).
+            for terminate_request in reply.to_terminate:
+                instance_id = terminate_request.instance_id
+                if terminate_request.instance_status == IMInstance.QUEUED:
+                    updates[instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.TERMINATED,
+                        termination_request=terminate_request,
+                        details=f"allocation canceled: {terminate_request.details}",
+                    )
+                elif terminate_request.instance_status in (
+                    IMInstance.ALLOCATED,
+                    IMInstance.RAY_INSTALLING,
+                ):
+                    im_instance_to_terminate = im_instances_by_instance_id[instance_id]
+                    updates[instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.TERMINATING,
+                        cloud_instance_id=im_instance_to_terminate.cloud_instance_id,
+                        termination_request=terminate_request,
+                        details=f"terminating ray: {terminate_request.details}",
+                    )
+                else:
+                    updates[instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.RAY_STOP_REQUESTED,
+                        termination_request=terminate_request,
+                        details=f"draining ray: {terminate_request.details}",
+                    )
+
+            # Fast upscaling: O(1) division instead of O(tasks*nodes) bin-packing.
+            node_type, count = compute_fast_target(
+                ray_state, autoscaling_config, autoscaler_instances
+            )
+            if count > 0:
+                logger.info(
+                    f"fast-path: queuing {count} instances of type {node_type}."
+                )
+            for _ in range(count):
                 instance_id = InstanceUtil.random_instance_id()
                 updates[instance_id] = IMInstanceUpdateEvent(
                     instance_id=instance_id,
                     new_instance_status=IMInstance.QUEUED,
-                    instance_type=launch_request.instance_type,
+                    instance_type=node_type,
                     upsert=True,
-                    details=(
-                        f"queuing new instance of {launch_request.instance_type} "
-                        "from scheduler"
-                    ),
+                    details=(f"fast-path: queuing {node_type} (skip bin-packing)"),
                 )
 
-        if isinstance(cloud_provider, KubeRayProvider):
-            cloud_provider.do_ippr_requests(reply.to_ippr)
+            if isinstance(cloud_provider, KubeRayProvider):
+                try:
+                    cloud_provider.do_ippr_requests(reply.to_ippr)
+                except Exception:
+                    logger.exception("Failed to execute IPPR resize requests.")
 
-        Reconciler._update_instance_manager(instance_manager, version, updates)
+            Reconciler._update_instance_manager(instance_manager, version, updates)
+        else:
+            # Normal path: full bin-packing scheduler.
+            reply = scheduler.schedule(sched_request)
+
+            autoscaling_state.infeasible_resource_requests.extend(
+                reply.infeasible_resource_requests
+            )
+            autoscaling_state.infeasible_gang_resource_requests.extend(
+                reply.infeasible_gang_resource_requests
+            )
+            autoscaling_state.infeasible_cluster_resource_constraints.extend(
+                reply.infeasible_cluster_resource_constraints
+            )
+
+            if not Reconciler._is_head_node_running(instance_manager):
+                return
+            if autoscaling_config.provider == Provider.READ_ONLY:
+                return
+
+            to_launch = reply.to_launch
+            to_terminate = reply.to_terminate
+            updates = {}
+            for terminate_request in to_terminate:
+                instance_id = terminate_request.instance_id
+                if terminate_request.instance_status == IMInstance.ALLOCATED:
+                    im_instance_to_terminate = im_instances_by_instance_id[instance_id]
+                    updates[terminate_request.instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.TERMINATING,
+                        cloud_instance_id=im_instance_to_terminate.cloud_instance_id,
+                        termination_request=terminate_request,
+                        details=f"terminating ray: {terminate_request.details}",
+                    )
+                else:
+                    updates[terminate_request.instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.RAY_STOP_REQUESTED,
+                        termination_request=terminate_request,
+                        details=f"draining ray: {terminate_request.details}",
+                    )
+
+            for launch_request in to_launch:
+                for _ in range(launch_request.count):
+                    instance_id = InstanceUtil.random_instance_id()
+                    updates[instance_id] = IMInstanceUpdateEvent(
+                        instance_id=instance_id,
+                        new_instance_status=IMInstance.QUEUED,
+                        instance_type=launch_request.instance_type,
+                        upsert=True,
+                        details=(
+                            f"queuing new instance of {launch_request.instance_type} "
+                            "from scheduler"
+                        ),
+                    )
+
+            if isinstance(cloud_provider, KubeRayProvider):
+                try:
+                    cloud_provider.do_ippr_requests(reply.to_ippr)
+                except Exception:
+                    logger.exception("Failed to execute IPPR resize requests.")
+
+            Reconciler._update_instance_manager(instance_manager, version, updates)
 
     @staticmethod
     def _terminate_instances(instance_manager: InstanceManager):
