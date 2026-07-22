@@ -20,6 +20,7 @@ py_test_module_list(
         "tests/test_allocation_timeout_recovery.py",
         "tests/test_config.py",
         "tests/test_event_logger.py",
+        "tests/test_fast_upscaling.py",
         "tests/test_instance_manager.py",
         "tests/test_instance_storage.py",
         "tests/test_instance_util.py",
