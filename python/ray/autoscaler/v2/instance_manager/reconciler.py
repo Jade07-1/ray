@@ -134,18 +134,24 @@ def compute_fast_target(
         if capacity > 0:
             needed = max(needed, math.ceil(demand / capacity))
 
-    # Count existing non-terminal instances of this type (in-flight capacity).
-    terminal_statuses = {
+    # Count existing instances that represent effective capacity (in-flight or running).
+    # Exclude all statuses where the node is going away or already gone.
+    unavailable_statuses = {
         IMInstance.TERMINATED,
         IMInstance.ALLOCATION_FAILED,
         IMInstance.RAY_STOP_REQUESTED,
+        IMInstance.RAY_STOPPING,
+        IMInstance.RAY_STOPPED,
+        IMInstance.TERMINATING,
+        IMInstance.TERMINATION_FAILED,
+        IMInstance.RAY_INSTALL_FAILED,
     }
     existing_count = sum(
         1
         for inst in existing_instances
         if inst.im_instance is not None
         and inst.im_instance.instance_type == node_type
-        and inst.im_instance.status not in terminal_statuses
+        and inst.im_instance.status not in unavailable_statuses
     )
 
     max_workers = autoscaling_config.get_max_num_worker_nodes()
@@ -160,20 +166,27 @@ def compute_fast_target(
 def _check_fast_path_degradation(
     existing_instances: List["AutoscalerInstance"],
 ) -> bool:
-    """Check if fast path should degrade due to high failure rate.
+    """Check if fast path should degrade due to high recent failure rate.
 
-    Returns True if the failure rate exceeds the degradation threshold,
-    meaning we should fall back to the normal scheduler path.
+    Only considers instances that entered REQUESTED or ALLOCATION_FAILED
+    within the last 30 seconds (roughly 6 reconcile cycles), so stale
+    historical failures don't permanently block the fast path.
+
+    Returns True if the failure rate exceeds the degradation threshold.
     """
+    cutoff_ns = time.time_ns() - 30 * 10**9
     requested_count = 0
     failed_count = 0
     for inst in existing_instances:
         if inst.im_instance is None:
             continue
-        if inst.im_instance.status == IMInstance.REQUESTED:
-            requested_count += 1
-        elif inst.im_instance.status == IMInstance.ALLOCATION_FAILED:
-            failed_count += 1
+        im = inst.im_instance
+        if im.status == IMInstance.REQUESTED:
+            if _last_status_time_ns(im, IMInstance.REQUESTED) >= cutoff_ns:
+                requested_count += 1
+        elif im.status == IMInstance.ALLOCATION_FAILED:
+            if _last_status_time_ns(im, IMInstance.ALLOCATION_FAILED) >= cutoff_ns:
+                failed_count += 1
 
     total = requested_count + failed_count
     if total == 0:
@@ -181,6 +194,15 @@ def _check_fast_path_degradation(
 
     failure_rate = failed_count / total
     return failure_rate > AUTOSCALER_FAST_UPSCALING_DEGRADATION_RATE
+
+
+def _last_status_time_ns(im_instance, status) -> int:
+    """Get the most recent timestamp when the instance entered the given status."""
+    latest = 0
+    for entry in im_instance.status_history:
+        if entry.instance_status == status and entry.timestamp_ns > latest:
+            latest = entry.timestamp_ns
+    return latest
 
 
 class Reconciler:

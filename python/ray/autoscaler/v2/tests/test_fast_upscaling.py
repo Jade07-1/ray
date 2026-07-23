@@ -267,6 +267,27 @@ class TestFastPathDegradation:
         # 3/10 = 30%, boundary -> no degradation
         assert _check_fast_path_degradation(instances) is False
 
+    def test_stale_failures_ignored(self):
+        """Failures older than 30s should not trigger degradation."""
+        # Create instances with old timestamps (60s ago)
+        old_ts = time.time_ns() - 60 * 10**9
+        stale_failed = []
+        for _ in range(5):
+            im = IMInstance()
+            im.instance_id = f"inst-{id(im)}"
+            im.instance_type = "worker"
+            im.status = IMInstance.ALLOCATION_FAILED
+            im.status_history.append(
+                IMInstance.StatusHistory(
+                    instance_status=IMInstance.ALLOCATION_FAILED,
+                    timestamp_ns=old_ts,
+                )
+            )
+            stale_failed.append(AutoscalerInstance(im_instance=im))
+
+        # Even though 5/5 = 100% failure, they're all stale -> no degradation
+        assert _check_fast_path_degradation(stale_failed) is False
+
 
 # ---------------------------------------------------------------------------
 # Integration test: fast path in _scale_cluster
