@@ -1377,8 +1377,13 @@ class Reconciler:
         if use_fast_path:
             logger.info("fast-path: homogeneous demand detected, skipping bin-packing.")
             # Run the scheduler with empty resource requests so it only
-            # performs termination decisions (idle, outdated, min/max)
+            # performs termination decisions (outdated, min/max)
             # without the expensive O(tasks*nodes) bin-packing.
+            # Crucially, disable idle termination (idle_timeout_s=None) because
+            # we have large pending demand — nodes that appear idle just haven't
+            # received tasks from GCS scheduler yet. Without this, the scheduler
+            # sees "no demand + idle workers" and terminates them, conflicting
+            # with the fast-path expansion.
             sched_request_for_terminate = SchedulingRequest(
                 node_type_configs=sched_request.node_type_configs,
                 max_num_nodes=sched_request.max_num_nodes,
@@ -1388,7 +1393,7 @@ class Reconciler:
                     sched_request.cluster_resource_constraints
                 ),
                 current_instances=sched_request.current_instances,
-                idle_timeout_s=sched_request.idle_timeout_s,
+                idle_timeout_s=None,
                 disable_launch_config_check=(sched_request.disable_launch_config_check),
             )
             reply = scheduler.schedule(sched_request_for_terminate)

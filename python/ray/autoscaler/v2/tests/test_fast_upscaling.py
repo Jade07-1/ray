@@ -27,7 +27,6 @@ from ray.core.generated.autoscaler_pb2 import (
 from ray.core.generated.instance_manager_pb2 import (
     Instance as IMInstance,
     NodeKind,
-    TerminationRequest,
 )
 
 # ---------------------------------------------------------------------------
@@ -412,8 +411,8 @@ class TestScaleClusterFastPath:
         "AUTOSCALER_FAST_UPSCALING_ENABLED",
         1,
     )
-    def test_idle_termination_still_works(self):
-        """Fast path still honors termination decisions from scheduler."""
+    def test_idle_termination_suppressed_during_fast_path(self):
+        """Fast path disables idle termination to prevent scale-up/down conflict."""
         head = self._make_head_instance()
         worker = IMInstance()
         worker.instance_id = "worker-idle-1"
@@ -433,17 +432,10 @@ class TestScaleClusterFastPath:
         requests = [_make_resource_request_by_count({"CPU": 1}, 200)]
         ray_state = _make_ray_state(pending_requests=requests)
 
-        # Scheduler says to terminate the idle worker
-        terminate_req = TerminationRequest(
-            instance_id="worker-idle-1",
-            instance_status=IMInstance.RAY_RUNNING,
-            details="idle timeout",
-        )
-
         scheduler = MagicMock()
         sched_reply = MagicMock()
         sched_reply.to_launch = []
-        sched_reply.to_terminate = [terminate_req]
+        sched_reply.to_terminate = []
         sched_reply.to_ippr = []
         sched_reply.infeasible_resource_requests = []
         sched_reply.infeasible_gang_resource_requests = []
@@ -469,14 +461,10 @@ class TestScaleClusterFastPath:
             cloud_provider=cloud_provider,
         )
 
-        call_args = im.update_instance_manager_state.call_args
-        request = call_args.kwargs.get("request") or call_args[0][0]
-        updates = list(request.updates)
-        stop_updates = [
-            u for u in updates if u.new_instance_status == IMInstance.RAY_STOP_REQUESTED
-        ]
-        assert len(stop_updates) == 1
-        assert stop_updates[0].instance_id == "worker-idle-1"
+        # Verify scheduler was called with idle_timeout_s=None
+        # (idle termination suppressed during fast path)
+        sched_call_args = scheduler.schedule.call_args[0][0]
+        assert sched_call_args.idle_timeout_s is None
 
     @patch(
         "ray.autoscaler.v2.instance_manager.reconciler."
