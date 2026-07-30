@@ -1418,6 +1418,9 @@ class Reconciler:
                 idle_timeout_s=None,
                 disable_launch_config_check=(sched_request.disable_launch_config_check),
             )
+            if isinstance(cloud_provider, KubeRayProvider):
+                sched_request_for_terminate.ippr_specs = sched_request.ippr_specs
+                sched_request_for_terminate.ippr_statuses = sched_request.ippr_statuses
             reply = scheduler.schedule(sched_request_for_terminate)
 
             autoscaling_state.infeasible_resource_requests.extend(
